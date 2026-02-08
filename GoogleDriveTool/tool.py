@@ -10,7 +10,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 
 # --- 설정 ---
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-SHEET_NAME = "sam14_generals"  # 기본 시트 이름
+DEFAULT_SHEET_NAME = "sam_data_integrated"  # 기본 파일(Workbook) 이름
 
 def get_client(credentials_path="credentials.json", token_path="token.json"):
     creds = None
@@ -46,117 +46,148 @@ def get_clean_value(val, target_type):
     except ValueError:
         return 0 if target_type in (int, float) else val
 
-def main(sheet_name=None, output_path=None, credentials_path=None, token_path=None):
+def process_worksheet(worksheet, output_dir):
+    """단일 워크시트를 처리하여 JSON으로 저장하는 함수"""
+    ws_title = worksheet.title
+    
+    # [규칙] 워크시트 이름이 '#'으로 시작하면 스킵
+    if ws_title.startswith('#'):
+        print(f"⏭️  Skip: '{ws_title}' (주석용 시트)")
+        return
+
+    print(f"🔄 Processing: '{ws_title}'...")
+    
+    raw_data = worksheet.get_all_values()
+    if len(raw_data) < 2:
+        print(f"⚠️  Warning: '{ws_title}' 데이터가 너무 적습니다. (Skip)")
+        return
+
+    headers = raw_data[0]
+    type_row = raw_data[1]
+    
+    # 1. 컬럼 타입 감지
+    column_types = [detect_type(val) for val in type_row]
+    
+    # 2. 헤더 그룹화
+    header_map = {}
+    regex = re.compile(r'^(.*?)[ _]*(\d+)$') 
+
+    for idx, header in enumerate(headers):
+        header = header.strip()
+        
+        # 헤더가 비어있거나 '#'으로 시작하면 무시
+        if not header or header.startswith('#'):
+            continue
+
+        match = regex.match(header)
+        if match:
+            base_name = match.group(1).strip()
+            if base_name == "": base_name = header 
+        else:
+            base_name = header
+        
+        if base_name not in header_map:
+            header_map[base_name] = []
+        header_map[base_name].append(idx)
+
+    final_data = []
+
+    # 3. 데이터 변환
+    for row in raw_data[1:]:
+        # 첫 번째 컬럼(ID)이 비어있으면 유효하지 않은 행으로 간주
+        if not row or not row[0].strip():
+            continue
+
+        item = {}
+        for base_name, col_indices in header_map.items():
+            
+            first_col_idx = col_indices[0]
+            is_array = len(col_indices) > 1 or headers[first_col_idx].strip() != base_name
+            
+            if is_array:
+                arr = []
+                for col_idx in col_indices:
+                    if col_idx < len(row):
+                        val = row[col_idx]
+                        type_ = column_types[col_idx]
+                        clean_val = get_clean_value(val, type_)
+                        
+                        if clean_val != "":
+                            arr.append(clean_val)
+                item[base_name] = arr
+            else:
+                if first_col_idx < len(row):
+                    val = row[first_col_idx]
+                    type_ = column_types[first_col_idx]
+                    item[base_name] = get_clean_value(val, type_)
+        
+        final_data.append(item)
+
+    # 4. JSON 파일 저장
+    json_filename = f"{ws_title}.json"
+    
+    # [수정된 부분] 변수명을 output_dir로 통일
+    if output_dir:
+         file_path = os.path.join(output_dir, json_filename)
+    else:
+         file_path = json_filename
+
     try:
-        print("구글 시트에 연결 중...")
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(final_data, f, ensure_ascii=False, indent=4)
+        print(f"✅ Saved: {file_path} ({len(final_data)} items)")
+        
+    except PermissionError:
+        print(f"❌ Error: '{file_path}' 파일을 저장할 수 없습니다. (Permission Denied)")
+    except Exception as e:
+        print(f"❌ Error saving '{file_path}': {e}")
+
+
+def main(sheet_name=None, output_dir=None, credentials_path=None, token_path=None):
+    try:
         credentials_path = credentials_path or "credentials.json"
         token_path = token_path or "token.json"
+        
+        print("connecting to Google Sheets...")
         gc = get_client(credentials_path, token_path)
-        sheet_name = sheet_name or SHEET_NAME
         
-        # output_path가 디렉토리면 {path}/{sheet_name}.json, 아니면 그대로 사용
-        if output_path:
-            if os.path.isdir(output_path):
-                json_file_name = os.path.join(output_path, f"{sheet_name}.json")
-            else:
-                json_file_name = output_path
-        else:
-            json_file_name = f"{sheet_name}.json"
-
-        # 에러 발생 시 open_by_url 사용 고려
-        sh = gc.open(sheet_name)
-        worksheet = sh.get_worksheet(0)
+        target_sheet_name = sheet_name or DEFAULT_SHEET_NAME
         
-        raw_data = worksheet.get_all_values()
-        if len(raw_data) < 2:
-            print("데이터가 너무 적습니다. (헤더 + 데이터 필요)")
+        # 워크북(파일) 열기
+        try:
+            sh = gc.open(target_sheet_name)
+        except gspread.exceptions.SpreadsheetNotFound:
+            print(f"❌ Error: 스프레드시트 '{target_sheet_name}'를 찾을 수 없습니다.")
             return
 
-        headers = raw_data[0]
-        type_row = raw_data[1]
-        
-        # 1. 컬럼 타입 감지
-        column_types = [detect_type(val) for val in type_row]
-        
-        # 2. 헤더 그룹화 (필터링 로직 추가됨)
-        header_map = {}
-        regex = re.compile(r'^(.*?)[ _]*(\d+)$') 
+        print(f"📂 Workbook: '{sh.title}'")
 
-        for idx, header in enumerate(headers):
-            header = header.strip()
-            
-            # [신규 규칙 1] 헤더가 비어있거나 '#'으로 시작하면 무시 (주석 컬럼)
-            if not header or header.startswith('#'):
-                continue
+        # 출력 폴더 생성 (없으면 생성)
+        if output_dir and not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+            print(f"📁 Created directory: {output_dir}")
 
-            match = regex.match(header)
-            if match:
-                base_name = match.group(1).strip()
-                if base_name == "": base_name = header 
-            else:
-                base_name = header
-            
-            if base_name not in header_map:
-                header_map[base_name] = []
-            header_map[base_name].append(idx)
+        # 모든 워크시트 순회
+        worksheets = sh.worksheets()
+        print(f"📊 Found {len(worksheets)} worksheets.")
+        print("-" * 30)
 
-        final_data = []
+        for ws in worksheets:
+            process_worksheet(ws, output_dir)
 
-        # 3. 데이터 변환
-        for row in raw_data[1:]:
-            
-            # [신규 규칙 2] 첫 번째 컬럼(인덱스)이 비어있으면 유효하지 않은 행으로 간주하고 건너뜀
-            if not row or not row[0].strip():
-                continue
-
-            item = {}
-            for base_name, col_indices in header_map.items():
-                
-                # 배열 여부 판단
-                first_col_idx = col_indices[0]
-                is_array = len(col_indices) > 1 or headers[first_col_idx].strip() != base_name
-                
-                if is_array:
-                    arr = []
-                    for col_idx in col_indices:
-                        if col_idx < len(row):
-                            val = row[col_idx]
-                            type_ = column_types[col_idx]
-                            clean_val = get_clean_value(val, type_)
-                            
-                            if clean_val != "":
-                                arr.append(clean_val)
-                    item[base_name] = arr
-                else:
-                    if first_col_idx < len(row):
-                        val = row[first_col_idx]
-                        type_ = column_types[first_col_idx]
-                        item[base_name] = get_clean_value(val, type_)
-            
-            final_data.append(item)
-
-        # 4. JSON 파일 덮어쓰기
-        try:
-            with open(json_file_name, 'w', encoding='utf-8') as f:
-                json.dump(final_data, f, ensure_ascii=False, indent=4)
-            
-            abs_path = os.path.abspath(json_file_name)
-            print(f"✅ 성공! 파일이 저장되었습니다.")
-            print(f"   위치: {abs_path}")
-            print(f"   데이터: {len(final_data)}개")
-            
-        except PermissionError:
-            print(f"❌ 오류: '{json_file_name}' 파일을 저장할 수 없습니다.")
-            print("파일이 다른 프로그램에서 열려 있다면 닫고 다시 실행해주세요.")
+        print("-" * 30)
+        print("🎉 All done.")
 
     except Exception as e:
-        print(f"❌ 예상치 못한 오류 발생: {e}")
+        print(f"❌ Unexpected Error: {e}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Export Google Sheet to JSON')
-    parser.add_argument('-s', '--sheet', help='Sheet name (overrides default)', default=None)
-    parser.add_argument('-o', '--output', help='Output file path (default: <sheet_name>.json)', default=None)
-    parser.add_argument('-c', '--credentials', help='Path to credentials.json file', default=None)
-    parser.add_argument('-t', '--token', help='Path to token.json file', default=None)
+    parser = argparse.ArgumentParser(description='Export Google Sheet Worksheets to JSON files')
+    parser.add_argument('-s', '--sheet', help='Google Sheet Name (Workbook)', default=None)
+    parser.add_argument('-o', '--output', help='Output Directory (default: current dir)', default=None)
+    parser.add_argument('-c', '--credentials', help='Path to credentials.json', default=None)
+    parser.add_argument('-t', '--token', help='Path to token.json', default=None)
+    
     args = parser.parse_args()
+    
     main(args.sheet, args.output, args.credentials, args.token)
