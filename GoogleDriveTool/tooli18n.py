@@ -11,8 +11,8 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
 DEFAULT_SHEET_NAME = "sam_string"  # 기본 파일 이름
 
-# [중요] 처리할 언어 코드 목록 (여기에 없으면 무시됨)
-TARGET_LANGUAGES = ["en", "ko", "ja", "zh-Hans", "zh-Hant"]
+# [중요] 처리할 언어 코드 목록
+TARGET_LANGUAGES = ["en", "ko", "ja", "zhHans", "zhHant"]
 
 def get_client(credentials_path="credentials.json", token_path="token.json"):
     creds = None
@@ -46,7 +46,7 @@ def save_i18n_json(base_output_dir, lang_code, sheet_name, data):
     try:
         with open(file_path, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=4)
-        print(f"   ✅ Saved [{lang_code}]: {file_path} ({len(data)} keys)")
+        print(f"   ✅ Saved [{lang_code}]: {file_path} ({len(data)} items)")
         
     except PermissionError:
         print(f"   ❌ Error: '{file_path}' 권한 없음. 파일을 닫아주세요.")
@@ -54,10 +54,9 @@ def save_i18n_json(base_output_dir, lang_code, sheet_name, data):
         print(f"   ❌ Error saving '{file_path}': {e}")
 
 def process_worksheet(worksheet, output_dir):
-    """다국어 시트를 처리하여 언어별 폴더에 Key-Value JSON으로 저장"""
+    """다국어 시트를 처리하여 언어별 폴더에 List<StringData> JSON으로 저장"""
     ws_title = worksheet.title
     
-    # 1. 워크시트 스킵 조건
     if ws_title.startswith('#'):
         print(f"⏭️  Skip: '{ws_title}' (주석용 시트)")
         return
@@ -70,7 +69,6 @@ def process_worksheet(worksheet, output_dir):
         return
 
     headers = raw_data[0]
-    
     processed_count = 0
 
     # 헤더(컬럼)를 순회하며 지정된 언어인지 확인
@@ -82,20 +80,19 @@ def process_worksheet(worksheet, output_dir):
             
         lang_code = header.strip()
         
-        # [핵심 변경] 지정된 언어 코드가 아니면 무시 (whitelist 방식)
+        # 지정된 언어 코드가 아니면 무시
         if lang_code not in TARGET_LANGUAGES:
-            # 필요하다면 로그 출력: print(f"   ℹ️ Ignored column: {lang_code}")
             continue
             
-        # 해당 언어의 Key-Value 데이터 생성
-        i18n_data = {}
+        # [수정됨] Dictionary 대신 List 생성
+        i18n_list = []
         
         for row in raw_data[1:]:
             if not row: continue
             
             key = row[0].strip()
             
-            # Key가 없거나 '#'으로 시작하면 해당 행은 무시 (주석)
+            # Key가 없거나 '#'으로 시작하면 무시
             if not key or key.startswith('#'):
                 continue
                 
@@ -105,10 +102,15 @@ def process_worksheet(worksheet, output_dir):
             else:
                 val = ""
             
-            i18n_data[key] = val
+            # [수정됨] { "key": ..., "value": ... } 객체 생성 후 리스트에 추가
+            entry = {
+                "key": key,
+                "value": val
+            }
+            i18n_list.append(entry)
 
         # 저장
-        save_i18n_json(output_dir, lang_code, ws_title, i18n_data)
+        save_i18n_json(output_dir, lang_code, ws_title, i18n_list)
         processed_count += 1
     
     if processed_count == 0:
@@ -152,7 +154,7 @@ def main(sheet_name=None, output_dir=None, credentials_path=None, token_path=Non
         print(f"❌ Unexpected Error: {e}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Export Google Sheet for i18n (Key-Value by Language)')
+    parser = argparse.ArgumentParser(description='Export Google Sheet for i18n (List of Objects)')
     parser.add_argument('-s', '--sheet', help='Google Sheet Name (Workbook)', default=None)
     parser.add_argument('-o', '--output', help='Output Root Directory', default=None)
     parser.add_argument('-c', '--credentials', help='Path to credentials.json', default=None)
